@@ -458,7 +458,80 @@ void Update_Servos_Gradually(void) {
     }
 }
 
+// 서스펜션을 중립 위치로 복귀
+void Reset_Suspension_To_Neutral(void) {
+    UART_SendString("Resetting suspension to neutral position...\r\n");
 
+    // 적분 항 초기화
+    integral_roll = 0.0f;
+    integral_pitch = 0.0f;
+
+    // 모든 서보를 중립 위치로
+    for(int i = 0; i < SERVO_COUNT; i++) {
+        servos[i].target_height = SUSPENSION_NEUTRAL;
+        servos[i].current_height = SUSPENSION_NEUTRAL;
+        smoothed_targets[i] = SUSPENSION_NEUTRAL;
+        Servo_SetHeight(i, SUSPENSION_NEUTRAL);
+    }
+}
+
+// CAN 초기화 함수
+void CAN_App_Init(void)
+{
+    CAN_FilterTypeDef filter = {0};
+
+    filter.FilterBank = 0;
+    filter.FilterMode = CAN_FILTERMODE_IDMASK;
+    filter.FilterScale = CAN_FILTERSCALE_32BIT;
+    filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+    filter.FilterActivation = ENABLE;
+
+    // 0x10 ID만 수신하도록 필터 설정
+    filter.FilterIdHigh     = (0x10 << 5);
+    filter.FilterIdLow      = 0x0000;
+    filter.FilterMaskIdHigh = (0x7FF << 5);  // 정확히 0x10만 매칭
+    filter.FilterMaskIdLow  = 0x0000;
+
+    if (HAL_CAN_ConfigFilter(&hcan1, &filter) != HAL_OK) Error_Handler();
+    if (HAL_CAN_Start(&hcan1) != HAL_OK) Error_Handler();
+    if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) Error_Handler();
+
+    UART_SendString("CAN initialized - Listening on ID 0x10\r\n");
+}
+
+
+// CAN 수신 콜백 함수
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (hcan->Instance != CAN1) return;
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK) return;
+    if (rxHeader.IDE != CAN_ID_STD) return;
+    if (rxHeader.DLC < 1) return;
+
+    if (rxHeader.StdId == 0x10) {
+        // 0x10: 서스펜션 ON/OFF 제어
+        // rxData[0] = 0(OFF), 1(ON)
+        uint8_t prev_state = g_suspension_enabled;
+
+        if (rxData[0] <= 1) {
+            g_suspension_enabled = rxData[0];
+
+            // 상태 변경 시 메시지 출력
+            if (prev_state != g_suspension_enabled) {
+                if (g_suspension_enabled) {
+                    UART_SendString("\r\n>>> Suspension Control ENABLED <<<\r\n");
+                } else {
+                    UART_SendString("\r\n>>> Suspension Control DISABLED <<<\r\n");
+                    // OFF될 때 서스펜션을 중립으로 복귀
+                    Reset_Suspension_To_Neutral();
+                }
+            }
+        }
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -547,9 +620,11 @@ int main(void)
         Calculate_Roll_Pitch();
         Apply_Complementary_Filter(dt);
 
-        // 서스펜션 높이 계산 및 적용
-        Calculate_Independent_Suspension_Heights();
-        Update_Servos_Gradually();
+        // 서스펜션 제어는 g_suspension_enabled가 1일 때만 수행
+        if (g_suspension_enabled) {
+        	Calculate_Independent_Suspension_Heights();
+        	Update_Servos_Gradually();
+        }
 
         loop_count++;
     }
@@ -563,13 +638,16 @@ int main(void)
         sprintf(buffer, "Roll: %.2f deg, Pitch: %.2f deg\r\n", imu.filtered_roll, imu.filtered_pitch);
         UART_SendString(buffer);
 
-        sprintf(buffer, "Wheel Heights (%%): FL=%.1f FR=%.1f RL=%.1f RR=%.1f\r\n",
-                servos[SERVO_FRONT_LEFT].current_height,
-                servos[SERVO_FRONT_RIGHT].current_height,
-                servos[SERVO_REAR_LEFT].current_height,
-                servos[SERVO_REAR_RIGHT].current_height);
-        UART_SendString(buffer);
-
+        if (g_suspension_enabled) {
+        	sprintf(buffer, "Wheel Heights (%%): FL=%.1f FR=%.1f RL=%.1f RR=%.1f\r\n",
+        			servos[SERVO_FRONT_LEFT].current_height,
+					servos[SERVO_FRONT_RIGHT].current_height,
+                            servos[SERVO_REAR_LEFT].current_height,
+							servos[SERVO_REAR_RIGHT].current_height);
+        	UART_SendString(buffer);
+        } else {
+        	UART_SendString("Suspension at NEUTRAL position\r\n");
+        }
 
         sprintf(buffer, "Loop Rate: %lu Hz\r\n", loop_count * 2);
         UART_SendString(buffer);
@@ -641,11 +719,11 @@ static void MX_CAN1_Init(void)
 
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 16;
+  hcan1.Init.Prescaler = 2;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_1TQ;
-  hcan1.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_13TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
