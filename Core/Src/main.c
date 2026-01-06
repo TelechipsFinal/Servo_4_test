@@ -52,20 +52,44 @@
 
 /* 차량 서스펜션 설정 */
 #define SUSPENSION_MIN_HEIGHT       25       // 0% (최소)
-#define SUSPENSION_MAX_HEIGHT       75     // 100% (최대)
+#define SUSPENSION_MAX_HEIGHT       80     // 100% (최대)
 #define SUSPENSION_NEUTRAL          30      // 평소 높이(작을수록 높은 것)
 
-/* 제어 파라미터 */
-#define UPDATE_RATE_MS              10      // 100Hz 업데이트
-#define ROLL_GAIN                   2.0f    // Roll 보상 게인
-#define PITCH_GAIN                  2.0f    // Pitch 보상 게인
-#define MAX_CORRECTION              55      // 최대 보정량 (%)
-#define COMPLEMENTARY_ALPHA         0.98f   // 상보 필터 계수
-#define DEADBAND                    0.1f    // 데드밴드 (도)
+/* PID 제어 파라미터 */
+#define UPDATE_RATE_MS              10      // 업데이트 RATE_MS - 고정
+#define MAX_CORRECTION              100      // 최대 보정량 (%) - 고정
+#define DEADBAND                    0.08f    // 데드밴드 (도)
 
-#define HEIGHT_CHANGE_SPEED     0.5f       // 한 번에 변경할 높이 (%, 클수록 빠름)
-#define LEVELING_GAIN           5.0f    // 수평 유지 강도 (높을수록 강함)
-#define MIN_ANGLE_CHANGE        0.8f    // 최소 감지 각도 (도)
+/* 차량 기하학 파라미터 (실제 차량에 맞게 조정 필요!) */
+#define WHEELBASE_MM                223.0f   // 축간 거리 (mm) - 앞뒤 바퀴 간격
+#define TRACK_WIDTH_MM              175.0f   // 좌우 바퀴 간격 (mm)
+#define SUSPENSION_TRAVEL_MM        23.0f    // 서스펜션 스트로크 (mm) - 25%~80% 범위
+#define HEIGHT_TO_PERCENT           2.39f     // 1mm = 2.5% (50% 범위 / 20mm)
+
+
+/* PID 게인 */
+#define LEVELING_GAIN           2.9f    // 수평 유지 강도
+#define INTEGRAL_GAIN           0.25f    // I 게인
+#define INTEGRAL_MAX            15.0f   // 적분 제한값
+#define DERIVATIVE_GAIN         0.02f    // D 게인: 각속도 변화 대응
+#define DERIVATIVE_FILTER       0.15f    // D 항 로우패스 필터 (노이즈 감소)
+
+// Kalman Filter 파라미터
+//Q : 자이로 적분으로 예측한 각도가 실제와 얼마나 다를 수 있나?
+//R : 가속도계로 측정한 각도의 노이즈 레벨
+#define KALMAN_Q_ANGLE    0.003f    // 작으면 자이로 중심
+#define KALMAN_Q_BIAS     0.00002f  // 드리프트 천천히 제거
+#define KALMAN_R_MEASURE  0.1f      // 작으면 가속도계 중심
+
+/* 스무딩 파라미터 */
+#define SMOOTH_ALPHA  0.25f  // 0~1, 작을수록 부드러움
+
+/* 가변 댐핑 (충격 감지용) */
+#define SHOCK_THRESHOLD         1.8f    // 1.8G 이상의 충격 감지 시 댐핑 모드
+#define SHOCK_DECAY             0.95f   // 충격 후 서서히 제어권 복귀
+#define SHOCK_CONTROL           0.3f    // 충격 시 제어 강도 (30%)
+#define SMOOTH_BASE             0.5f    // 스무딩 기본값
+#define SMOOTH_RANGE            0.2f    // 스무딩 가변 범위
 
 /* 서보 인덱스 */
 typedef enum {
@@ -75,6 +99,16 @@ typedef enum {
     SERVO_REAR_RIGHT  = 3,
     SERVO_COUNT       = 4
 } ServoIndex;
+
+/* Kalman Filter 구조체 */
+typedef struct {
+    float angle;
+    float bias;       // 바이어스 추정
+    float P[2][2];
+    float Q_angle;
+    float Q_bias;
+    float R_measure;
+} KalmanFilter;
 
 
 /* USER CODE END PD */
@@ -111,24 +145,32 @@ typedef struct {
     uint16_t target_height;     // 0~100%
 } Servo;
 
+/* PID 제어용 구조체 */
+typedef struct {
+    float error;
+    float prev_error;
+    float integral;
+    float derivative;
+    float filtered_derivative;
+    float output;
+} PID_Controller;
+
 IMU_Data imu = {0};
 Servo servos[SERVO_COUNT];
 uint32_t last_update_time = 0;
 float roll_offset = 0.0f;
 float pitch_offset = 0.0f;
-float prev_target_heights[4] = {30, 30, 30, 30};  // ← 추가
 
-// ✅ 추가: 적분 제어
-float integral_roll = 0.0f;
-float integral_pitch = 0.0f;
-#define INTEGRAL_GAIN   0.4f
-#define INTEGRAL_MAX    30.0f
+// PID 제어기
+PID_Controller pid_roll = {0};
+PID_Controller pid_pitch = {0};
 
-float smoothed_targets[4] = {30, 30, 30, 30};  // ← 추가
-#define SMOOTH_ALPHA  0.15f  // 0~1, 작을수록 부드러움
+float smoothed_targets[4] = {30, 30, 30, 30};
 
-// CAN 제어 변수 추가
-static volatile uint8_t g_suspension_enabled = 0;  // 0: OFF, 1: ON
+KalmanFilter kalman_roll;
+KalmanFilter kalman_pitch;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -141,24 +183,8 @@ static void MX_TIM4_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
-void UART_SendString(char* str);
-void ICM20948_CS_Low(void);
-void ICM20948_CS_High(void);
-void ICM20948_SelectBank(uint8_t bank);
-void ICM20948_WriteReg(uint8_t reg, uint8_t data);
-uint8_t ICM20948_ReadReg(uint8_t reg);
-void ICM20948_ReadMultipleReg(uint8_t reg, uint8_t *data, uint8_t len);
-uint8_t ICM20948_Init(void);
-void ICM20948_ReadAccelGyro(void);
-void Calculate_Roll_Pitch(void);
-void Apply_Complementary_Filter(float dt);
-void Suspension_Init(void);
-void Servo_SetHeight(ServoIndex idx, uint16_t height_percent);
-void Servo_SetPulse(ServoIndex idx, uint16_t pulse);
 uint16_t Constrain_u16(uint16_t value, uint16_t min, uint16_t max);
 float Constrain_f(float value, float min, float max);
-void Calculate_Suspension_Heights_Independent(uint32_t current_time);
-void Update_Z_Accel_History(ServoIndex idx, float z_accel);
 
 /* USER CODE END PFP */
 
@@ -282,14 +308,56 @@ void Calculate_Roll_Pitch(void) {
 	imu.pitch = raw_pitch - pitch_offset;
 }
 
-void Apply_Complementary_Filter(float dt) {
-    float gyro_roll_delta = imu.gyro_x * dt;
-    float gyro_pitch_delta = imu.gyro_y * dt;
+void Kalman_Init(KalmanFilter *kf) {
+    kf->angle = 0.0f;
+    kf->bias = 0.0f;  // ⭐ 바이어스 초기값
 
-    imu.filtered_roll = COMPLEMENTARY_ALPHA * (imu.filtered_roll + gyro_roll_delta) +
-                        (1.0f - COMPLEMENTARY_ALPHA) * imu.roll;
-    imu.filtered_pitch = COMPLEMENTARY_ALPHA * (imu.filtered_pitch + gyro_pitch_delta) +
-                         (1.0f - COMPLEMENTARY_ALPHA) * imu.pitch;
+    // P 행렬 초기화 (2x2 단위 행렬)
+    kf->P[0][0] = 1.0f;  // 각도 불확실성
+    kf->P[0][1] = 0.0f;
+    kf->P[1][0] = 0.0f;
+    kf->P[1][1] = 1.0f;  // 바이어스 불확실성
+
+    // 노이즈 파라미터
+    kf->Q_angle = KALMAN_Q_ANGLE;
+    kf->Q_bias = KALMAN_Q_BIAS;
+    kf->R_measure = KALMAN_R_MEASURE;
+}
+
+float Kalman_Update(KalmanFilter *kf, float newAngle, float newRate, float dt)
+{
+    // Predict
+    float rate = newRate - kf->bias;
+    kf->angle += dt * rate;
+
+    kf->P[0][0] += dt * (dt*kf->P[1][1] - kf->P[0][1] - kf->P[1][0] + kf->Q_angle);
+    kf->P[0][1] -= dt * kf->P[1][1];
+    kf->P[1][0] -= dt * kf->P[1][1];
+    kf->P[1][1] += kf->Q_bias * dt;
+
+    // 적응형 R 계산 (추가된 부분)
+    // 진동이나 회전이 강할수록 R값을 키워서 가속도계의 오차를 무시합니다.
+    float motion = fabsf(newRate);
+    float adaptive_R = kf->R_measure * (1.0f + motion);
+
+    // Update
+    float y = newAngle - kf->angle;
+    float S = kf->P[0][0] + adaptive_R;
+    float K0 = kf->P[0][0] / S;
+    float K1 = kf->P[1][0] / S;
+
+    kf->angle += K0 * y;
+    kf->bias  += K1 * y;
+
+    float P00 = kf->P[0][0];
+    float P01 = kf->P[0][1];
+
+    kf->P[0][0] -= K0 * P00;
+    kf->P[0][1] -= K0 * P01;
+    kf->P[1][0] -= K1 * P00;
+    kf->P[1][1] -= K1 * P01;
+
+    return kf->angle;
 }
 
 void Suspension_Init(void) {
@@ -304,7 +372,7 @@ void Suspension_Init(void) {
     servos[SERVO_REAR_LEFT].channel = TIM_CHANNEL_1;
 
     servos[SERVO_REAR_RIGHT].htim = &htim4;
-    servos[SERVO_REAR_RIGHT].channel = TIM_CHANNEL_3;  // CH2로 변경!
+    servos[SERVO_REAR_RIGHT].channel = TIM_CHANNEL_3;
 
     // PWM 시작
     for(int i = 0; i < SERVO_COUNT; i++) {
@@ -353,7 +421,7 @@ void IMU_Calibrate(void) {
     char buffer[100];
     float roll_sum = 0.0f;
     float pitch_sum = 0.0f;
-    const int samples = 250;  // 5초 @ 50Hz
+    const int samples = 150;  // 5초 @ 50Hz
 
     UART_SendString("\r\n=== IMU Calibration Start ===\r\n");
     UART_SendString("Keep vehicle on flat surface for 5 seconds...\r\n");
@@ -383,72 +451,129 @@ void IMU_Calibrate(void) {
 }
 
 /**
- * @brief 실시간 수평 유지 - 각 바퀴 독립 제어
+ * @brief 각도를 서스펜션 높이 변화량(%)으로 변환
+ *
+ * @param angle_deg 각도 (도)
+ * @param distance_mm 해당 축의 거리 (wheelbase 또는 track width)
+ * @return 필요한 높이 변화량 (%)
  */
-void Calculate_Independent_Suspension_Heights(void) {
-    // 1. 입력 필터 (반응성을 위해 가중치 조정)
-    static float lpf_roll = 0, lpf_pitch = 0;
-    lpf_roll = (lpf_roll * 0.6f) + (imu.filtered_roll * 0.4f);
-    lpf_pitch = (lpf_pitch * 0.6f) + (imu.filtered_pitch * 0.4f);
+float Angle_To_Height_Change(float angle_deg, float distance_mm) {
+    // 각도를 라디안으로 변환
+    float angle_rad = angle_deg * M_PI / 180.0f;
 
-    // 2. 적분 제어 (낮은 각도에서 끝까지 밀어주는 동력)
-    // 미세한 각도라도 데드밴드(0.2도)만 넘으면 즉시 적분 시작
-    if(fabsf(lpf_roll) > DEADBAND) {
-       integral_roll += lpf_roll * 0.05f;
+    // 필요한 높이 차이 = distance * sin(angle)
+    float height_diff_mm = distance_mm * sinf(angle_rad);
+
+    // mm를 %로 변환
+    float height_percent = height_diff_mm * HEIGHT_TO_PERCENT;
+
+    return height_percent;
+}
+
+void PID_Compute(PID_Controller *pid, float error, float dt) {
+    pid->error = error;
+
+    // I: 적분 제어
+    if(fabsf(error) > DEADBAND) {
+        pid->integral += error * dt;
+        pid->integral = Constrain_f(pid->integral, -INTEGRAL_MAX, INTEGRAL_MAX);
     } else {
-       // 데드밴드 이내면 아주 빠르게 0으로 수렴시켜서 "슬금슬금" 움직이는 현상 방지
-       integral_roll *= 0.5f;
-       if(fabsf(integral_roll) < 0.01f) integral_roll = 0;
+        pid->integral *= 0.98f;
     }
 
-    if(fabsf(lpf_pitch) > DEADBAND) {
-        integral_pitch += lpf_pitch * 0.05f;
-    } else {
-        integral_pitch *= 0.5f;
-        if(fabsf(integral_pitch) < 0.01f) integral_pitch = 0;
-    }
+    // D: 미분 제어
+    float raw_derivative = (error - pid->prev_error) / dt;
+    pid->filtered_derivative = (DERIVATIVE_FILTER * pid->filtered_derivative) +
+                               ((1.0f - DERIVATIVE_FILTER) * raw_derivative);
+    pid->derivative = pid->filtered_derivative;
+    pid->prev_error = error;
 
-    integral_roll = Constrain_f(integral_roll, -INTEGRAL_MAX, INTEGRAL_MAX);
-    integral_pitch = Constrain_f(integral_pitch, -INTEGRAL_MAX, INTEGRAL_MAX);
+    // PID 출력 = P + I + D
+    pid->output = error * LEVELING_GAIN +
+                  pid->integral * INTEGRAL_GAIN +
+                  pid->derivative * DERIVATIVE_GAIN;
+}
 
-    // 3. 비선형 제어량 계산 (P를 강화하고 I를 합산)
-    // 각도가 낮을 때도 LEVELING_GAIN이 높아서 즉각 반응합니다.
-    float r_ctrl = (lpf_roll * LEVELING_GAIN) + (integral_roll * INTEGRAL_GAIN);
-    float p_ctrl = (lpf_pitch * LEVELING_GAIN) + (integral_pitch * INTEGRAL_GAIN);
+/**
+ * @brief PID 제어를 사용한 실시간 수평 유지 (기하학적 변환 적용)
+ */
+void Calculate_Independent_Suspension_Heights_PID(float dt) {
+    // 1. 진동 감지 로직 (부드러운 감쇄)
+    static float prev_roll = 0.0f, prev_pitch = 0.0f;
+    static float p_r_chg = 0.0f, p_p_chg = 0.0f;
+    static int osc_count = 0;
 
+    float r_chg = imu.filtered_roll - prev_roll;
+    float p_chg = imu.filtered_pitch - prev_pitch;
+
+    // 방향 전환 빈도가 높으면 진동으로 간주
+    if((r_chg * p_r_chg < 0) || (p_chg * p_p_chg < 0)) osc_count = 8;
+    else if(osc_count > 0) osc_count--;
+
+    prev_roll = imu.filtered_roll; prev_pitch = imu.filtered_pitch;
+    p_r_chg = r_chg; p_p_chg = p_chg;
+
+    // 2. 부스트 및 댐핑 결정
+    float boost = 1.0f;
+    float total_tilt = fabsf(imu.filtered_roll) + fabsf(imu.filtered_pitch);
+
+    // 방지턱 모드: 기울기가 크면 파워 업
+    if (total_tilt > 3.0f) boost = 1.6f;
+
+    // 진동 모드: 떨림이 감지되면 파워 다운 (부스트보다 진동 억제 우선)
+    float osc_damping = (osc_count > 0) ? 0.6f : 1.0f;
+
+    // 3. 기하학적 높이 변화량 계산
+    float r_h_change = Angle_To_Height_Change(imu.filtered_roll, TRACK_WIDTH_MM / 2.0f);
+    float p_h_change = Angle_To_Height_Change(imu.filtered_pitch, WHEELBASE_MM / 2.0f);
+
+    // 4. PID 실행
+    PID_Compute(&pid_roll, r_h_change, dt);
+    PID_Compute(&pid_pitch, p_h_change, dt);
+
+    float r_ctrl = pid_roll.output * boost * osc_damping;
+    float p_ctrl = pid_pitch.output * boost * osc_damping;
+
+    // 5. 서보 타겟 할당 (부호 주의: 작을수록 차고 높음)
+    // 차체가 앞으로 숙여지면(Pitch +) 앞바퀴를 밀어내야 함(수치 감소)
     float target_f[4];
-    // 부호 주의: 센서 방향에 맞춰 수평을 잡도록 네 바퀴 연산
     target_f[SERVO_FRONT_LEFT]  = (float)SUSPENSION_NEUTRAL + r_ctrl - p_ctrl;
     target_f[SERVO_FRONT_RIGHT] = (float)SUSPENSION_NEUTRAL - r_ctrl - p_ctrl;
     target_f[SERVO_REAR_LEFT]   = (float)SUSPENSION_NEUTRAL + r_ctrl + p_ctrl;
     target_f[SERVO_REAR_RIGHT]  = (float)SUSPENSION_NEUTRAL - r_ctrl + p_ctrl;
 
-    // 4. 제한 및 필터링
+    // 6. 가변 스무딩 적용 및 저장
     for(int i = 0; i < SERVO_COUNT; i++) {
-        // 중립 기준 최대 이동폭 제한 확인
-        float diff = target_f[i] - (float)SUSPENSION_NEUTRAL;
-        diff = Constrain_f(diff, -(float)MAX_CORRECTION, (float)MAX_CORRECTION);
-
-        float final_val = (float)SUSPENSION_NEUTRAL + diff;
-        final_val = Constrain_f(final_val, (float)SUSPENSION_MIN_HEIGHT, (float)SUSPENSION_MAX_HEIGHT);
-
-        // 지수 이동 평균으로 부드럽게 목표값 전달
-        smoothed_targets[i] = (SMOOTH_ALPHA * final_val) + ((1.0f - SMOOTH_ALPHA) * smoothed_targets[i]);
+        float val = Constrain_f(target_f[i], SUSPENSION_MIN_HEIGHT, SUSPENSION_MAX_HEIGHT);
+        // 평소엔 부드럽게, 방지턱에선(boost > 1.0) 더 빠르게 반응
+        float alpha = (boost > 1.0f) ? 0.95f : SMOOTH_BASE;
+        smoothed_targets[i] = (alpha * val) + ((1.0f - alpha) * smoothed_targets[i]);
         servos[i].target_height = (uint16_t)(smoothed_targets[i] + 0.5f);
     }
 }
 
 /**
- * @brief 서보를 목표 높이로 점진적으로 이동
+ * @brief 서보를 목표 높이로 빠르게 추종
  */
 void Update_Servos_Gradually(void) {
     for(int i = 0; i < SERVO_COUNT; i++) {
         float gap = (float)servos[i].target_height - servos[i].current_height;
 
-        // 추종 계수를 0.08에서 0.12로 상향 (반응 지연 감소)
-        float step = gap * 0.12f;
+        // 훨씬 빠른 추종 속도
+        float step_gain;
+        if(fabsf(gap) > 15.0f) {
+            step_gain = 0.25f;  // 0.10 → 0.35 (대폭 증가)
+        } else if(fabsf(gap) > 5.0f) {
+            step_gain = 0.08f;  // 0.08 → 0.25
+        } else if(fabsf(gap) > 3.0f) {
+            step_gain = 0.03f;  // 0.03 → 0.15
+        } else {
+            step_gain = 0.08f;  // 미세 조정
+        }
 
-        if (fabsf(gap) > 0.05f) {
+        float step = gap * step_gain;
+
+        if (fabsf(gap) > 0.05f) {  // 0.1 → 0.05
             servos[i].current_height += step;
         } else {
             servos[i].current_height = (float)servos[i].target_height;
@@ -542,7 +667,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	char buffer[256];
+  char buffer[256];
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -570,81 +696,92 @@ int main(void)
   MX_SPI1_Init();
   MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
-    UART_SendString("\r\n\r\n");
-    UART_SendString("=====================================\r\n");
-    UART_SendString("  ICM-20948 + 4x Servo Active Suspension\r\n");
-    UART_SendString("  Auto-Leveling System\r\n");
-    UART_SendString("=====================================\r\n\r\n");
+  UART_SendString("\r\n\r\n");
+  UART_SendString("=====================================\r\n");
+  UART_SendString("  ICM-20948 + 4x Servo Active Suspension\r\n");
+  UART_SendString("  PID Auto-Leveling System\r\n");
+  UART_SendString("=====================================\r\n\r\n");
 
-    HAL_Delay(100);
+  HAL_Delay(100);
 
-    // ICM-20948 초기화
-    if (ICM20948_Init() == 0) {
-        UART_SendString("ICM-20948 Init Success!\r\n");
-    } else {
-        UART_SendString("ICM-20948 Init Failed!\r\n");
-        while(1);
-    }
+  // ICM-20948 초기화
+  if (ICM20948_Init() == 0) {
+      UART_SendString("ICM-20948 Init Success!\r\n");
+  } else {
+      UART_SendString("ICM-20948 Init Failed!\r\n");
+      while(1);
+  }
 
-    // 서스펜션 초기화
-    UART_SendString("Initializing Suspension System...\r\n");
-    Suspension_Init();
-    UART_SendString("System Ready!\r\n\r\n");
+  // 서스펜션 초기화
+  UART_SendString("Initializing Suspension System...\r\n");
+  Suspension_Init();
+  UART_SendString("System Ready!\r\n\r\n");
 
-    IMU_Calibrate();
+  IMU_Calibrate();
 
-    HAL_Delay(500);
+  Kalman_Init(&kalman_roll);
+  Kalman_Init(&kalman_pitch);
 
-    ICM20948_SelectBank(0);
-    last_update_time = HAL_GetTick();
+  HAL_Delay(500);
 
-    uint32_t loop_count = 0;
-    uint32_t last_print_time = HAL_GetTick();
+  ICM20948_SelectBank(0);
+  last_update_time = HAL_GetTick();
 
-    UART_SendString("Starting active suspension control...\r\n\r\n");
+  uint32_t loop_count = 0;
+  uint32_t last_print_time = HAL_GetTick();
+
+  UART_SendString("Starting active suspension control...\r\n\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-    while (1)
-  {
-    uint32_t current_time = HAL_GetTick();
+  while (1)
+    {
+      uint32_t current_time = HAL_GetTick();
 
-    // 50Hz 제어 루프
-    if (current_time - last_update_time >= UPDATE_RATE_MS) {
-        float dt = (current_time - last_update_time) / 1000.0f;
-        last_update_time = current_time;
+      // 100Hz 제어 루프
+      if (current_time - last_update_time >= UPDATE_RATE_MS) {
+          float dt = (current_time - last_update_time) / 1000.0f;
+          last_update_time = current_time;
 
-        // IMU 데이터 읽기
-        ICM20948_ReadAccelGyro();
-        Calculate_Roll_Pitch();
-        Apply_Complementary_Filter(dt);
+          // IMU 데이터 읽기
+          ICM20948_ReadAccelGyro();
+          Calculate_Roll_Pitch();
+          imu.filtered_roll = Kalman_Update(&kalman_roll, imu.roll, imu.gyro_x, dt);
+          imu.filtered_pitch = Kalman_Update(&kalman_pitch, imu.pitch, imu.gyro_y, dt);
 
         // 서스펜션 제어는 g_suspension_enabled가 1일 때만 수행
         if (g_suspension_enabled) {
-        	Calculate_Independent_Suspension_Heights();
+        	Calculate_Independent_Suspension_Heights_PID(dt);
         	Update_Servos_Gradually();
         }
 
-        loop_count++;
-    }
+          loop_count++;
+      }
 
     // 500ms마다 데이터 출력
     if (current_time - last_print_time >= 500) {
         last_print_time = current_time;
 
-        UART_SendString("\r\n=== Independent Wheel Control ===\r\n");
+        UART_SendString("\r\n=== PID Control Status ===\r\n");
 
         sprintf(buffer, "Roll: %.2f deg, Pitch: %.2f deg\r\n", imu.filtered_roll, imu.filtered_pitch);
         UART_SendString(buffer);
 
         if (g_suspension_enabled) {
-        	sprintf(buffer, "Wheel Heights (%%): FL=%.1f FR=%.1f RL=%.1f RR=%.1f\r\n",
-        			servos[SERVO_FRONT_LEFT].current_height,
-					servos[SERVO_FRONT_RIGHT].current_height,
-                            servos[SERVO_REAR_LEFT].current_height,
-							servos[SERVO_REAR_RIGHT].current_height);
-        	UART_SendString(buffer);
+         sprintf(buffer, "PID Pitch - P:%.2f I:%.2f D:%.2f Out:%.2f\r\n",
+                pid_pitch.error * LEVELING_GAIN,
+                pid_pitch.integral * INTEGRAL_GAIN,
+                pid_pitch.derivative * DERIVATIVE_GAIN,
+                pid_pitch.output);
+        UART_SendString(buffer);
+
+        sprintf(buffer, "Wheel Heights (%%): FL=%.1f FR=%.1f RL=%.1f RR=%.1f\r\n",
+                servos[SERVO_FRONT_LEFT].current_height,
+                servos[SERVO_FRONT_RIGHT].current_height,
+                servos[SERVO_REAR_LEFT].current_height,
+                servos[SERVO_REAR_RIGHT].current_height);
+        UART_SendString(buffer);
         } else {
         	UART_SendString("Suspension at NEUTRAL position\r\n");
         }
