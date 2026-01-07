@@ -91,6 +91,8 @@
 #define SMOOTH_BASE             0.5f    // 스무딩 기본값
 #define SMOOTH_RANGE            0.2f    // 스무딩 가변 범위
 
+static volatile uint8_t g_suspension_enabled = 1;
+
 /* 서보 인덱스 */
 typedef enum {
     SERVO_FRONT_LEFT  = 0,
@@ -424,7 +426,7 @@ void IMU_Calibrate(void) {
     const int samples = 150;  // 5초 @ 50Hz
 
     UART_SendString("\r\n=== IMU Calibration Start ===\r\n");
-    UART_SendString("Keep vehicle on flat surface for 5 seconds...\r\n");
+    UART_SendString("Keep vehicle on flat surface for 3 seconds...\r\n");
 
     for(int i = 0; i < samples; i++) {
         ICM20948_ReadAccelGyro();
@@ -473,6 +475,14 @@ float Angle_To_Height_Change(float angle_deg, float distance_mm) {
 void PID_Compute(PID_Controller *pid, float error, float dt) {
     pid->error = error;
 
+    // 급격한 오차 변화 감지 (충격)
+    float error_change = fabsf(error - pid->prev_error);
+
+    // 충격 감지 시 적분항 리셋 (핵심!)
+    if (error_change > 15.0f) {  // 15% 이상 급변하면 충격으로 간주
+        pid->integral *= 0.2f;  // 80% 제거
+    }
+
     // I: 적분 제어
     if(fabsf(error) > DEADBAND) {
         pid->integral += error * dt;
@@ -507,7 +517,7 @@ void Calculate_Independent_Suspension_Heights_PID(float dt) {
     float p_chg = imu.filtered_pitch - prev_pitch;
 
     // 방향 전환 빈도가 높으면 진동으로 간주
-    if((r_chg * p_r_chg < 0) || (p_chg * p_p_chg < 0)) osc_count = 8;
+    if((r_chg * p_r_chg < 0) || (p_chg * p_p_chg < 0)) osc_count = 12;
     else if(osc_count > 0) osc_count--;
 
     prev_roll = imu.filtered_roll; prev_pitch = imu.filtered_pitch;
@@ -521,7 +531,7 @@ void Calculate_Independent_Suspension_Heights_PID(float dt) {
     if (total_tilt > 3.0f) boost = 1.6f;
 
     // 진동 모드: 떨림이 감지되면 파워 다운 (부스트보다 진동 억제 우선)
-    float osc_damping = (osc_count > 0) ? 0.6f : 1.0f;
+    float osc_damping = (osc_count > 0) ? 0.4f : 1.0f;
 
     // 3. 기하학적 높이 변화량 계산
     float r_h_change = Angle_To_Height_Change(imu.filtered_roll, TRACK_WIDTH_MM / 2.0f);
@@ -559,26 +569,45 @@ void Update_Servos_Gradually(void) {
     for(int i = 0; i < SERVO_COUNT; i++) {
         float gap = (float)servos[i].target_height - servos[i].current_height;
 
-        // 훨씬 빠른 추종 속도
+        static float prev_targets[4] = {30, 30, 30, 30};
+        float target_change = fabsf(servos[i].target_height - prev_targets[i]);
+
         float step_gain;
-        if(fabsf(gap) > 15.0f) {
-            step_gain = 0.25f;  // 0.10 → 0.35 (대폭 증가)
-        } else if(fabsf(gap) > 5.0f) {
-            step_gain = 0.08f;  // 0.08 → 0.25
-        } else if(fabsf(gap) > 3.0f) {
-            step_gain = 0.03f;  // 0.03 → 0.15
-        } else {
-            step_gain = 0.08f;  // 미세 조정
+
+        if(target_change > 8.0f) {
+            step_gain = 0.02f;
+        }
+        else if(fabsf(gap) > 20.0f) {
+            step_gain = 0.15f;  // 새로 추가
+        }
+        else if(fabsf(gap) > 15.0f) {
+            step_gain = 0.12f;  // 0.20 → 0.12
+        }
+        else if(fabsf(gap) > 10.0f) {
+            step_gain = 0.09f;  // 새로 추가
+        }
+        else if(fabsf(gap) > 5.0f) {
+            step_gain = 0.06f;
+        }
+        else if(fabsf(gap) > 3.0f) {
+            step_gain = 0.04f;  // 0.02 → 0.04
+        }
+        else if(fabsf(gap) > 1.0f) {
+            step_gain = 0.03f;  // 새로 추가
+        }
+        else {
+            step_gain = 0.05f;
         }
 
         float step = gap * step_gain;
 
-        if (fabsf(gap) > 0.05f) {  // 0.1 → 0.05
+        if (fabsf(gap) > 0.05f) {
             servos[i].current_height += step;
         } else {
             servos[i].current_height = (float)servos[i].target_height;
         }
 
+        prev_targets[i] = servos[i].target_height;
         Servo_SetHeight(i, (uint16_t)(servos[i].current_height + 0.5f));
     }
 }
@@ -587,9 +616,14 @@ void Update_Servos_Gradually(void) {
 void Reset_Suspension_To_Neutral(void) {
     UART_SendString("Resetting suspension to neutral position...\r\n");
 
-    // 적분 항 초기화
-    integral_roll = 0.0f;
-    integral_pitch = 0.0f;
+    // 적분 항 초기화 (integral을 초기화해야 함)
+    pid_roll.integral = 0.0f;    // ✅ 수정
+    pid_roll.prev_error = 0.0f;
+    pid_roll.output = 0.0f;
+
+    pid_pitch.integral = 0.0f;   // ✅ 수정
+    pid_pitch.prev_error = 0.0f;
+    pid_pitch.output = 0.0f;
 
     // 모든 서보를 중립 위치로
     for(int i = 0; i < SERVO_COUNT; i++) {
