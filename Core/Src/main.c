@@ -119,6 +119,31 @@
 #define SMOOTH_BASE                0.5f     // 기본 스무딩 값
 #define SMOOTH_RANGE               0.2f     // 스무딩 가변 범위
 
+/* ISO 2631-1 진동 측정 파라미터 */
+#define VDV_SAMPLE_RATE         100.0f      // 100Hz 샘플링
+#define VDV_WINDOW_SIZE         700        // 7초 (100Hz * 7s)
+#define WEIGHTING_FILTER_ORDER  2           // 2차 필터
+#define GRAVITY                 9.81f       // m/s²
+/* 상수 정의 수정 */
+#define FILTER_WARMUP_SAMPLES   200     // 2초 워밍업 (100Hz)
+#define GRAVITY_OFFSET_SAMPLES  100     // 중력 오프셋 계산용
+
+/* ISO 2631-1 Wk 필터 파라미터 */
+#define WK_FILTER_FS        100.0f      // 샘플링 주파수 (Hz)
+#define WK_FILTER_ORDER     4           // 4차 필터 (2개의 2차 섹션)
+
+// Wk 필터 주파수 (ISO 2631-1 기준)
+#define WK_F1               0.4f        // Hz - 고역통과
+#define WK_F2               12.5f       // Hz - 저역통과 1
+#define WK_F3               12.5f       // Hz - 저역통과 2
+#define WK_F4               2.37f       // Hz - 추가 고역통과
+
+// 각주파수 계산
+#define WK_W1               (2.0f * M_PI * WK_F1)
+#define WK_W2               (2.0f * M_PI * WK_F2)
+#define WK_W3               (2.0f * M_PI * WK_F3)
+#define WK_W4               (2.0f * M_PI * WK_F4)
+
 /* ========================================================================
    서보모터 인덱스 열거형
    ======================================================================== */
@@ -143,6 +168,59 @@ typedef struct {
     float Q_bias;       // 프로세스 노이즈 (바이어스)
     float R_measure;    // 측정 노이즈
 } KalmanFilter;
+/**
+ * @brief Biquad 필터 구조체 (Direct Form II Transposed)
+ *
+ * 전달함수: H(z) = (b0 + b1·z⁻¹ + b2·z⁻²) / (1 + a1·z⁻¹ + a2·z⁻²)
+ */
+typedef struct {
+    // 필터 계수
+    float b0, b1, b2;  // 분자 계수
+    float a1, a2;      // 분모 계수 (a0 = 1로 정규화)
+
+    // 상태 변수 (Direct Form II Transposed)
+    float z1, z2;      // 지연 상태
+} Biquad_Filter;
+
+/**
+ * @brief Wk 필터 체인 구조체
+ *
+ * ISO 2631-1 Wk 필터는 4개의 2차 섹션(Biquad)으로 구성됩니다:
+ * 1. 고역통과 필터 (0.4 Hz) - 중력 성분 제거
+ * 2. 저역통과 필터 (12.5 Hz) - 고주파 노이즈 제거
+ * 3. 고역통과 필터 (2.37 Hz) - 인체 민감도 증가 시작점
+ * 4. 저역통과 필터 (12.5 Hz) - 추가 평활화
+ */
+typedef struct {
+    Biquad_Filter section1;  // 고역통과 0.4 Hz
+    Biquad_Filter section2;  // 저역통과 12.5 Hz
+    Biquad_Filter section3;  // 고역통과 2.37 Hz
+    Biquad_Filter section4;  // 저역통과 12.5 Hz
+} Wk_Filter_Chain;
+
+/* ISO 2631-1 진동 측정 구조체 - 수정 버전 */
+typedef struct {
+    float accel_buffer[VDV_WINDOW_SIZE];
+    uint16_t buffer_index;
+    uint16_t sample_count;
+
+    float rms;
+    float vdv;
+    float peak_accel;
+
+    Wk_Filter_Chain wk_filter;
+
+    uint8_t measurement_active;
+    uint32_t measurement_start_time;
+    float measurement_duration;
+
+    // 추가: 필터 안정화 관련
+    uint16_t warmup_samples;        // 워밍업 샘플 수
+    float gravity_offset;           // 중력 오프셋
+    uint8_t warmup_complete;        // 워밍업 완료 플래그
+} ISO2631_Measurement;
+
+ISO2631_Measurement vibration_data = {0};
 
 /* USER CODE END PD */
 
@@ -228,6 +306,9 @@ KalmanFilter kalman_pitch;               // 피치 각도 필터
 
 // CAN 통신으로 제어되는 서스펜션 ON/OFF 플래그
 volatile uint8_t g_suspension_enabled = 1;  // 0=OFF, 1=ON
+
+/* 측정 모드 플래그 */
+static volatile uint8_t g_vibration_measurement_enabled = 0;
 
 /* USER CODE END PV */
 
@@ -1164,7 +1245,353 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     }
 }
 
+
+/**
+ * @brief Bilinear Transform을 사용한 2차 Butterworth 필터 계수 계산
+ *
+ * @param biquad 필터 구조체 포인터
+ * @param fc 차단 주파수 (Hz)
+ * @param fs 샘플링 주파수 (Hz)
+ * @param type 0=저역통과(LPF), 1=고역통과(HPF)
+ */
+void Biquad_Init(Biquad_Filter *biquad, float fc, float fs, uint8_t type) {
+    // 상태 변수 초기화
+    biquad->z1 = 0.0f;
+    biquad->z2 = 0.0f;
+
+    // Bilinear Transform
+    float omega = 2.0f * M_PI * fc / fs;  // 디지털 주파수
+    float K = tanf(omega / 2.0f);         // Pre-warping
+    float K2 = K * K;
+    float sqrt2 = 1.414213562f;           // √2
+    float norm;
+
+    if (type == 0) {
+        // 저역통과 필터 (LPF)
+        norm = 1.0f / (1.0f + sqrt2 * K + K2);
+        biquad->b0 = K2 * norm;
+        biquad->b1 = 2.0f * biquad->b0;
+        biquad->b2 = biquad->b0;
+        biquad->a1 = 2.0f * (K2 - 1.0f) * norm;
+        biquad->a2 = (1.0f - sqrt2 * K + K2) * norm;
+    } else {
+        // 고역통과 필터 (HPF)
+        norm = 1.0f / (1.0f + sqrt2 * K + K2);
+        biquad->b0 = 1.0f * norm;
+        biquad->b1 = -2.0f * biquad->b0;
+        biquad->b2 = biquad->b0;
+        biquad->a1 = 2.0f * (K2 - 1.0f) * norm;
+        biquad->a2 = (1.0f - sqrt2 * K + K2) * norm;
+    }
+}
+
+/**
+ * @brief Biquad 필터 실행 (Direct Form II Transposed)
+ *
+ * 이 구조는 수치적으로 안정적이며 계수 양자화에 강인합니다.
+ *
+ * @param biquad 필터 구조체 포인터
+ * @param input 입력 샘플
+ * @return 필터링된 출력 샘플
+ */
+float Biquad_Process(Biquad_Filter *biquad, float input) {
+    // Direct Form II Transposed 구조
+    float output = input * biquad->b0 + biquad->z1;
+
+    biquad->z1 = input * biquad->b1 - output * biquad->a1 + biquad->z2;
+    biquad->z2 = input * biquad->b2 - output * biquad->a2;
+
+    return output;
+}
+
+/**
+ * @brief Wk 필터 체인 초기화
+ *
+ * ISO 2631-1 Wk 필터는 다음과 같이 구성됩니다:
+ * - Section 1: 고역통과 0.4 Hz (중력/DC 제거)
+ * - Section 2: 저역통과 12.5 Hz (앨리어싱 방지)
+ * - Section 3: 고역통과 2.37 Hz (인체 민감도 증가 시작)
+ * - Section 4: 저역통과 12.5 Hz (추가 평활화)
+ *
+ * @param wk Wk 필터 체인 포인터
+ */
+void Wk_Filter_Init(Wk_Filter_Chain *wk) {
+    // Section 1: 고역통과 0.4 Hz - 중력 및 초저주파 제거
+    Biquad_Init(&wk->section1, WK_F1, WK_FILTER_FS, 1);  // HPF
+
+    // Section 2: 저역통과 12.5 Hz - 고주파 노이즈 제거
+    Biquad_Init(&wk->section2, WK_F2, WK_FILTER_FS, 0);  // LPF
+
+    // Section 3: 고역통과 2.37 Hz - 인체가 민감해지는 주파수 강조
+    Biquad_Init(&wk->section3, WK_F4, WK_FILTER_FS, 1);  // HPF
+
+    // Section 4: 저역통과 12.5 Hz - 최종 평활화
+    Biquad_Init(&wk->section4, WK_F3, WK_FILTER_FS, 0);  // LPF
+
+    UART_SendString("Wk Filter initialized with 4 Biquad sections\r\n");
+}
+
+/**
+ * @brief Wk 필터 체인 실행
+ *
+ * 4개의 2차 섹션을 순차적으로 통과시켜 ISO 2631-1 Wk 특성을 구현합니다.
+ *
+ * @param wk Wk 필터 체인 포인터
+ * @param input 원시 가속도 (g)
+ * @return 가중된 가속도 (m/s²)
+ */
+float Wk_Filter_Process(Wk_Filter_Chain *wk, float input) {
+    // g를 m/s²로 변환
+    float accel_ms2 = input * GRAVITY;
+
+    // 4단계 필터링
+    float stage1 = Biquad_Process(&wk->section1, accel_ms2);
+    float stage2 = Biquad_Process(&wk->section2, stage1);
+    float stage3 = Biquad_Process(&wk->section3, stage2);
+    float stage4 = Biquad_Process(&wk->section4, stage3);
+
+    return stage4;
+}
+
+/**
+ * @brief ISO 2631-1 측정 초기화
+ */
+void ISO2631_Init(void) {
+    memset(&vibration_data, 0, sizeof(ISO2631_Measurement));
+    vibration_data.measurement_active = 0;
+    vibration_data.warmup_complete = 0;
+    vibration_data.gravity_offset = 0.0f;
+
+    // Wk 필터 초기화
+    Wk_Filter_Init(&vibration_data.wk_filter);
+
+    UART_SendString("ISO 2631-1 Vibration Measurement Initialized\r\n");
+}
+
+/**
+ * @brief ISO 2631-1 Wk 주파수 가중 필터 적용 (업데이트된 버전)
+ * @param raw_accel 원시 가속도 (g)
+ * @return 가중된 가속도 (m/s²)
+ */
+float ISO2631_Apply_Weighting(float raw_accel) {
+    // 워밍업 중에는 필터만 워밍업, 실제 데이터는 버림
+    float accel_corrected = raw_accel - 1.0f;  // 항상 중력 제거
+
+    // 워밍업 완료 후 정확한 오프셋 사용
+    if (vibration_data.warmup_complete) {
+        accel_corrected = raw_accel - vibration_data.gravity_offset;
+    }
+
+    return Wk_Filter_Process(&vibration_data.wk_filter, accel_corrected);
+}
+
+/**
+ * @brief 샘플 추가 및 실시간 계산
+ * @param weighted_accel 가중된 가속도 (m/s²)
+ */
+void ISO2631_Add_Sample(float weighted_accel, float raw_accel_z) {
+    if (!vibration_data.measurement_active) return;
+
+    // 워밍업 단계
+    if (!vibration_data.warmup_complete) {
+        // 워밍업 기간 동안은 원시 Z축 데이터 저장 (중력 오프셋 계산용)
+    	if (vibration_data.warmup_samples < GRAVITY_OFFSET_SAMPLES) {
+    	    vibration_data.accel_buffer[vibration_data.warmup_samples] = raw_accel_z;  // ✅ 파라미터로 받음
+    	}
+
+        vibration_data.warmup_samples++;
+
+        // 워밍업 완료 체크
+        if (vibration_data.warmup_samples >= FILTER_WARMUP_SAMPLES) {
+            vibration_data.warmup_complete = 1;
+
+            // 중력 오프셋 계산
+            ISO2631_Calculate_Gravity_Offset();
+
+            // 버퍼 초기화 (실제 측정 시작)
+            memset(&vibration_data.accel_buffer, 0, sizeof(vibration_data.accel_buffer));
+            vibration_data.buffer_index = 0;
+            vibration_data.sample_count = 0;
+            vibration_data.peak_accel = 0.0f;
+
+            UART_SendString("Warmup complete - Starting measurement\r\n");
+        }
+        return;
+    }
+
+    // 실제 측정 단계
+    vibration_data.accel_buffer[vibration_data.buffer_index] = weighted_accel;
+    vibration_data.buffer_index = (vibration_data.buffer_index + 1) % VDV_WINDOW_SIZE;
+
+    if (vibration_data.sample_count < VDV_WINDOW_SIZE) {
+        vibration_data.sample_count++;
+    }
+
+    // 피크값 업데이트 (절댓값)
+    float abs_accel = fabsf(weighted_accel);
+    if (abs_accel > vibration_data.peak_accel) {
+        vibration_data.peak_accel = abs_accel;
+    }
+}
+
+/**
+ * @brief RMS 및 VDV 계산
+ *
+ * RMS (a_w): 정상 상태 진동 평가
+ *   a_w = √(1/T ∫₀ᵀ a²(t) dt)
+ *
+ * VDV: 충격성 진동 평가 (과도 진동에 민감)
+ *   VDV = (∫₀ᵀ a⁴(t) dt)^(1/4)
+ */
+void ISO2631_Calculate_Metrics(void) {
+    if (vibration_data.sample_count == 0) return;
+
+    float sum_square = 0.0f;
+    float sum_fourth = 0.0f;
+
+    // RMS 및 VDV 계산
+    for (uint16_t i = 0; i < vibration_data.sample_count; i++) {
+        float a = vibration_data.accel_buffer[i];
+        sum_square += a * a;
+        sum_fourth += powf(fabsf(a), 4.0f);
+    }
+
+    // RMS = sqrt(mean(a²))
+    vibration_data.rms = sqrtf(sum_square / vibration_data.sample_count);
+
+    // VDV = (∫a⁴dt)^(1/4)
+    // dt = 1/fs (샘플링 간격)
+    float dt = 1.0f / VDV_SAMPLE_RATE;
+    float T = vibration_data.sample_count * dt;
+    vibration_data.vdv = powf(sum_fourth * dt, 0.25f);
+
+    vibration_data.measurement_duration = T;
+}
+
+/**
+ * @brief 측정 시작
+ */
+void ISO2631_Start_Measurement(void) {
+    memset(&vibration_data.accel_buffer, 0, sizeof(vibration_data.accel_buffer));
+    vibration_data.buffer_index = 0;
+    vibration_data.sample_count = 0;
+    vibration_data.rms = 0.0f;
+    vibration_data.vdv = 0.0f;
+    vibration_data.peak_accel = 0.0f;
+    vibration_data.warmup_samples = 0;
+    vibration_data.warmup_complete = 0;
+
+    // Wk 필터 상태 리셋
+    Wk_Filter_Init(&vibration_data.wk_filter);
+
+    vibration_data.measurement_active = 1;
+    vibration_data.measurement_start_time = HAL_GetTick();
+
+    UART_SendString("\r\n>>> ISO 2631-1 Measurement STARTED <<<\r\n");
+    UART_SendString("Filter warming up (2 seconds)...\r\n");
+}
+
+/**
+ * @brief 중력 오프셋 계산 (Z축 정적 가속도 제거)
+ */
+void ISO2631_Calculate_Gravity_Offset(void) {
+    float sum = 0.0f;
+    uint16_t count = GRAVITY_OFFSET_SAMPLES;
+
+    if (count > vibration_data.warmup_samples) {
+        count = vibration_data.warmup_samples;
+    }
+
+    // 워밍업 기간 동안의 평균 Z축 가속도 계산
+    for (uint16_t i = 0; i < count; i++) {
+        sum += vibration_data.accel_buffer[i];
+    }
+
+    vibration_data.gravity_offset = sum / count;
+
+    char buffer[100];
+    sprintf(buffer, "Gravity offset calculated: %.4f g\r\n",
+            vibration_data.gravity_offset);
+    UART_SendString(buffer);
+}
+
+/**
+ * @brief 측정 종료 및 결과 출력
+ */
+void ISO2631_Stop_Measurement(void) {
+    vibration_data.measurement_active = 0;
+
+    // 워밍업이 완료되지 않았으면 측정 무효
+    if (!vibration_data.warmup_complete) {
+        UART_SendString("\r\n>>> Measurement ABORTED (warmup incomplete) <<<\r\n");
+        return;
+    }
+
+    // 최종 계산
+    ISO2631_Calculate_Metrics();
+
+    char buffer[256];
+    UART_SendString("\r\n");
+    UART_SendString("╔═══════════════════════════════════════════════╗\r\n");
+    UART_SendString("║   ISO 2631-1 VIBRATION MEASUREMENT RESULTS   ║\r\n");
+    UART_SendString("╠═══════════════════════════════════════════════╣\r\n");
+
+    sprintf(buffer, "║ Duration:      %.2f seconds                   ║\r\n",
+            vibration_data.measurement_duration);
+    UART_SendString(buffer);
+
+    sprintf(buffer, "║ Samples:       %u                             ║\r\n",
+            vibration_data.sample_count);
+    UART_SendString(buffer);
+
+    sprintf(buffer, "║ Sample Rate:   %.0f Hz                         ║\r\n",
+            VDV_SAMPLE_RATE);
+    UART_SendString(buffer);
+
+    sprintf(buffer, "║ Gravity Offset: %.4f g                        ║\r\n",
+            vibration_data.gravity_offset);
+    UART_SendString(buffer);
+
+    UART_SendString("╠═══════════════════════════════════════════════╣\r\n");
+
+    sprintf(buffer, "║ RMS (a_w):     %.4f m/s²                      ║\r\n",
+            vibration_data.rms);
+    UART_SendString(buffer);
+
+    sprintf(buffer, "║ VDV:           %.4f m/s^1.75                  ║\r\n",
+            vibration_data.vdv);
+    UART_SendString(buffer);
+
+    sprintf(buffer, "║ Peak Accel:    %.4f m/s²                      ║\r\n",
+            vibration_data.peak_accel);
+    UART_SendString(buffer);
+
+    UART_SendString("╠═══════════════════════════════════════════════╣\r\n");
+
+    // RMS 기반 평가
+    UART_SendString("║ Comfort Assessment (8-hour exposure):        ║\r\n");
+    if (vibration_data.rms < 0.315f) {
+        UART_SendString("║ Status: ✓ NOT UNCOMFORTABLE                  ║\r\n");
+    } else if (vibration_data.rms < 0.63f) {
+        UART_SendString("║ Status: △ A LITTLE UNCOMFORTABLE             ║\r\n");
+    } else if (vibration_data.rms < 1.0f) {
+        UART_SendString("║ Status: ⚠ FAIRLY UNCOMFORTABLE               ║\r\n");
+    } else if (vibration_data.rms < 1.6f) {
+        UART_SendString("║ Status: ⚠ UNCOMFORTABLE                      ║\r\n");
+    } else if (vibration_data.rms < 2.5f) {
+        UART_SendString("║ Status: ✗ VERY UNCOMFORTABLE                 ║\r\n");
+    } else {
+        UART_SendString("║ Status: ✗✗ EXTREMELY UNCOMFORTABLE           ║\r\n");
+    }
+
+    UART_SendString("╚═══════════════════════════════════════════════╝\r\n");
+    UART_SendString("\r\n>>> Measurement STOPPED <<<\r\n\r\n");
+}
+
+
 /* USER CODE END 0 */
+
+
 
 /**
   * @brief  The application entry point.
@@ -1256,8 +1683,15 @@ int main(void)
   // 피치 각도용 칼만 필터 초기화
   Kalman_Init(&kalman_pitch);
 
+  // ISO 2631-1 측정 초기화 및 자동 시작
+  ISO2631_Init();
+
   // 추가 안정화 대기
   HAL_Delay(500);
+
+  // 측정 자동 시작
+  ISO2631_Start_Measurement();
+  g_vibration_measurement_enabled = 1;  // 측정 활성화
 
   /* ========================================================================
      제어 루프 준비
@@ -1323,7 +1757,19 @@ int main(void)
                                              imu.pitch,     // 가속도계 피치 각도
                                              imu.gyro_y,    // 자이로 Y축 각속도
                                              dt);           // 시간 간격
+          // ⭐ ISO 2631-1 측정 (수직 방향 Z축)
+          if (g_vibration_measurement_enabled && vibration_data.measurement_active) {
+              float weighted_accel = ISO2631_Apply_Weighting(imu.accel_z);
+              ISO2631_Add_Sample(weighted_accel, imu.accel_z);
 
+              // ⭐ 워밍업 완료 후 7초(700 샘플) 도달 시 자동 종료
+              if (vibration_data.warmup_complete &&
+                  vibration_data.sample_count >= VDV_WINDOW_SIZE) {
+                  ISO2631_Stop_Measurement();
+                  g_vibration_measurement_enabled = 0;
+                  UART_SendString("\r\n>>> 7 seconds completed - Measurement finished <<<\r\n");
+              }
+          }
           /* ================================================================
              서스펜션 제어 (CAN 명령에 의해 활성화된 경우만)
              ================================================================ */
